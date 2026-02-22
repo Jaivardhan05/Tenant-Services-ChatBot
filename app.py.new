@@ -1,0 +1,153 @@
+import streamlit as st
+import requests
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SCALEDOWN_API_KEY = os.getenv("SCALEDOWN_API_KEY")
+SCALEDOWN_URL = os.getenv("SCALEDOWN_API_URL", "https://api.scaledown.xyz/compress/raw/")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+
+SYSTEM_CONTEXT = """You are a helpful tenant services assistant for Riverside Apartments. 
+Answer questions about: quiet hours (10pm-8am), maintenance requests, rent payments (due 1st of month), 
+guest parking, pet policy (no pets over 25lbs), amenities (gym, pool, rooftop), lease renewals, 
+and move-in/out procedures. Be friendly, concise and professional."""
+
+# Helper: compress prompt via ScaleDown
+def compress_with_scaledown(question):
+    headers = {
+        "x-api-key": SCALEDOWN_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "context": SYSTEM_CONTEXT,
+        "prompt": question,
+        "scaledown": { "rate": "auto" }
+    }
+    try:
+        response = requests.post(SCALEDOWN_URL, json=payload, headers=headers, timeout=15)
+    except Exception:
+        return question
+    if response.status_code == 200:
+        try:
+            j = response.json()
+            # per spec: results.compressed_prompt
+            return j["results"]["compressed_prompt"]
+        except Exception:
+            return question
+    return question  # fallback
+
+# Helper: get AI answer (Ollama -> ScaleDown fallback)
+def get_ai_answer(compressed_prompt):
+    # Try Ollama local API first
+    try:
+        ollama_payload = {
+            "model": "llama3.2",
+            "messages": [
+                {"role": "system", "content": SYSTEM_CONTEXT},
+                {"role": "user", "content": compressed_prompt}
+            ],
+            "stream": False
+        }
+        resp = requests.post(OLLAMA_URL, json=ollama_payload, timeout=10)
+        if resp.status_code == 200:
+            try:
+                j = resp.json()
+                # expected: { "message": { "content": "..." } }
+                return j["message"]["content"]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Fallback: ask ScaleDown to answer directly
+    headers = {
+        "x-api-key": SCALEDOWN_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "context": "Answer this tenant question directly, helpfully and in plain English. Give a real answer.",
+        "prompt": compressed_prompt,
+        "scaledown": { "rate": "auto" }
+    }
+    try:
+        r = requests.post(SCALEDOWN_URL, json=payload, headers=headers, timeout=15)
+    except Exception:
+        return "Unable to connect to the assistant. Please try again."
+    if r.status_code == 200:
+        try:
+            res = r.json()
+            return res.get("answer") or res.get("output") or res.get("response") or res.get("results", {}).get("compressed_prompt") or "I received your question but could not generate an answer. Please contact leasing directly."
+        except Exception:
+            return "Received invalid response from assistant."
+    if r.status_code == 403:
+        return "❌ Invalid API key — check SCALEDOWN_API_KEY in .env"
+    if r.status_code == 404:
+        return "❌ Wrong endpoint — check SCALEDOWN_API_URL in .env"
+    return f"Assistant returned status {r.status_code}: {r.text}"
+
+# Streamlit UI
+st.set_page_config(page_title="Tenant Services Chatbot", layout="wide")
+st.title("Tenant Services Chatbot")
+st.caption("Powered by ScaleDown + local Ollama (when available) — Riverside Apartments")
+
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+
+# Sidebar quick actions
+st.sidebar.title("Quick Actions")
+if st.sidebar.button("Submit Maintenance Request"):
+    pre = "I need to submit a maintenance request for my unit."
+    st.session_state["messages"].append({"role": "user", "content": pre})
+if st.sidebar.button("Check Rent Due Date"):
+    pre = "When is my rent due and how can I pay it?"
+    st.session_state["messages"].append({"role": "user", "content": pre})
+if st.sidebar.button("Book Amenity"):
+    pre = "I want to book the gym for next Saturday. How do I do that?"
+    st.session_state["messages"].append({"role": "user", "content": pre})
+if st.sidebar.button("Contact Leasing"):
+    pre = "How can I contact leasing for urgent issues?"
+    st.session_state["messages"].append({"role": "user", "content": pre})
+
+# Display existing messages
+for msg in st.session_state["messages"]:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"]) 
+
+# Process any prefilled messages immediately (those added by sidebar buttons)
+if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
+    last = st.session_state["messages"][-1]["content"]
+    # If last message has not yet been answered (no assistant reply after it), process
+    # Check: if there is no assistant message following it
+    idx = len(st.session_state["messages"]) - 1
+    answered = False
+    if idx + 1 < len(st.session_state["messages"]):
+        for m in st.session_state["messages"][idx+1:]:
+            if m["role"] == "assistant":
+                answered = True
+                break
+    if not answered:
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                compressed = compress_with_scaledown(last)
+                answer = get_ai_answer(compressed)
+                st.write(answer)
+        st.session_state["messages"].append({"role": "assistant", "content": answer})
+
+# Chat input
+question = st.chat_input("Ask anything about your lease, maintenance, payments or amenities...")
+
+if question:
+    # append user message
+    st.session_state["messages"].append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.write(question)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            compressed = compress_with_scaledown(question)
+            answer = get_ai_answer(compressed)
+            st.write(answer)
+    st.session_state["messages"].append({"role": "assistant", "content": answer})
