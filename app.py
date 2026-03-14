@@ -1,8 +1,18 @@
 import streamlit as st
 import requests
 import os
+import random
+import pandas as pd
 import google.generativeai as genai
 from dotenv import load_dotenv
+from database import (
+    login_user, register_user, get_all_tenants,
+    get_all_payments, add_payment, add_complaint,
+    resolve_complaint, get_all_complaints,
+    add_feedback, get_all_feedback, add_announcement,
+    get_announcements, record_manual_payment,
+    get_tenant_payments, update_user_balance
+)
 
 load_dotenv()
 
@@ -103,10 +113,11 @@ html, body, [class*="css"] {
 /* Sidebar brand/title */
 .sidebar-brand {
     color: #f6b26b;
-    font-size: 1.12rem;
-    font-weight: 600;
+    font-size: 1.4rem;
+    font-weight: 700;
     letter-spacing: 0.01em;
-    margin: 0.15rem 0 0.55rem 0;
+    margin: 0.2rem 0 0.6rem 0;
+    line-height: 1.2;
 }
 
 /* Sidebar link style (used by buttons visually) */
@@ -344,6 +355,15 @@ div[data-testid="stChatInput"] button:hover {
     color: #c0544a !important;
 }
 
+.auth-button > button {
+    background-color: #4a7fe8 !important;
+    color: white !important;
+    border-radius: 6px !important;
+    width: 100% !important;
+    padding: 10px !important;
+    font-weight: 500 !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -357,219 +377,531 @@ if not GEMINI_API_KEY:
     st.error("GEMINI_API_KEY missing in .env")
     st.stop()
 
+# Initialize session state for auth
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+if "role" not in st.session_state:
+    st.session_state["role"] = None
+
 # Initialize chat history and feedback log
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 if "feedback_log" not in st.session_state:
     st.session_state["feedback_log"] = []
 
-# Sidebar (simplified)
-st.sidebar.markdown("<div class='sidebar-brand'>Riverside Apartments</div>", unsafe_allow_html=True)
-quick_questions = {
-    "Submit Maintenance Request": "How do I submit a maintenance request?",
-    "Check Rent Due Date": "When is my rent due and what is the late fee?",
-    "Book Rooftop Lounge": "How do I book the rooftop lounge?",
-    "Pet Policy": "What is the pet policy?",
-    "Quiet Hours": "What are the quiet hours?",
-    "Emergency Contacts": "What are the emergency contact numbers?"
-}
-for label, prefill in quick_questions.items():
-    if st.sidebar.button(label):
-        if not st.session_state["messages"] or st.session_state["messages"][-1]["content"] != prefill:
-            st.session_state["messages"].append({"role": "user", "content": prefill})
-            st.rerun()
+# ── AUTH GATE ──────────────────────────────────────────────────────────────────
+if not st.session_state["logged_in"]:
+    st.markdown(
+        "<h2 style='text-align:center;color:#f6b26b;'>Riverside Apartments</h2>",
+        unsafe_allow_html=True,
+    )
+    auth_tabs = st.tabs(["Sign In", "Create Account"])
+
+    # ── Sign In ────────────────────────────────────────────────────────────────
+    with auth_tabs[0]:
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.markdown("## Welcome Back")
+            st.markdown("Sign in to your tenant portal")
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            st.markdown('<div class="auth-button">', unsafe_allow_html=True)
+            if st.button("Sign In", key="signin_btn"):
+                user = login_user(username, password)
+                if user:
+                    st.session_state["logged_in"] = True
+                    st.session_state["user"] = user
+                    st.session_state["role"] = user.get("role", "tenant")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Create Account ─────────────────────────────────────────────────────────
+    with auth_tabs[1]:
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.markdown("## Create Your Account")
+            name = st.text_input("Full Name", key="reg_name")
+            email = st.text_input("Email Address", key="reg_email")
+            phone = st.text_input("Phone Number", placeholder="+91 XXXXX XXXXX", key="reg_phone")
+            unit = st.text_input("Unit Number", placeholder="e.g. 2B, 3C", key="reg_unit")
+            reg_username = st.text_input("Username", key="reg_username")
+            reg_password = st.text_input("Password", type="password", key="reg_password")
+            confirm = st.text_input("Confirm Password", type="password", key="reg_confirm")
+            st.markdown('<div class="auth-button">', unsafe_allow_html=True)
+            if st.button("Create Account", key="register_btn"):
+                if not all([name, email, phone, unit, reg_username, reg_password, confirm]):
+                    st.error("All fields required")
+                elif reg_password != confirm:
+                    st.error("Passwords do not match")
+                elif len(reg_password) < 8:
+                    st.error("Password must be 8+ characters")
+                elif "@" not in email:
+                    st.error("Invalid email address")
+                else:
+                    ok, msg = register_user(reg_username, reg_password, name, email, unit, phone)
+                    if ok:
+                        st.success("Account created! You can now sign in.")
+                    else:
+                        st.error(msg)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    st.stop()
+
+# ── SIDEBAR (post-login) ───────────────────────────────────────────────────────
+user = st.session_state["user"]
+role = st.session_state["role"]
+
+st.sidebar.markdown(
+    f"<div class='sidebar-brand' style='font-size:1.35rem;font-weight:700;"
+    f"color:#f6b26b;letter-spacing:0.01em;margin-bottom:4px;'>"
+    f"{user['name']}</div>",
+    unsafe_allow_html=True,
+)
+st.sidebar.markdown(
+    f"<div style='color:#a0a6b4;font-size:13px;margin-bottom:4px;'>"
+    f"{'Admin' if role == 'admin' else 'Unit ' + user['unit']}</div>",
+    unsafe_allow_html=True,
+)
+st.sidebar.markdown("---")
+
+if role == "tenant":
+    quick_questions = {
+        "Submit Maintenance Request": "How do I submit a maintenance request?",
+        "Check Rent Due Date": "When is my rent due and what is the late fee?",
+        "Book Rooftop Lounge": "How do I book the rooftop lounge?",
+        "Pet Policy": "What is the pet policy?",
+        "Quiet Hours": "What are the quiet hours?",
+        "Emergency Contacts": "What are the emergency contact numbers?"
+    }
+    for label, prefill in quick_questions.items():
+        if st.sidebar.button(label):
+            if not st.session_state["messages"] or st.session_state["messages"][-1]["content"] != prefill:
+                st.session_state["messages"].append({"role": "user", "content": prefill})
+                st.rerun()
+else:
+    for label in ["Overview", "Tenants", "Payments", "Complaints", "Announcements"]:
+        st.sidebar.markdown(f"<span class='sidebar-link'>{label}</span>", unsafe_allow_html=True)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Leasing Office**")
-st.sidebar.markdown("(512) 847-3300")
+st.sidebar.markdown("+91 98765 43210")
 st.sidebar.markdown("leasing@riversideapts.com")
+st.sidebar.markdown("---")
 
-# Top tabs
-tabs = st.tabs(["Dashboard", "Chat Assistant", "Rent & Payments", "Feedback"])
+if st.sidebar.button("Sign Out"):
+    st.session_state.clear()
+    st.rerun()
 
-####################
-# Tab 1: Dashboard
-####################
-with tabs[0]:
-    st.markdown("<div class='section-header'>Overview</div>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns(3)
-    with col1:
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADMIN VIEW
+# ═══════════════════════════════════════════════════════════════════════════════
+if role == "admin":
+    admin_tabs = st.tabs(["Overview", "Tenants", "Payments", "Complaints", "Announcements"])
+
+    # ── Overview ───────────────────────────────────────────────────────────────
+    with admin_tabs[0]:
+        st.markdown("<div class='section-header'>Admin Overview</div>", unsafe_allow_html=True)
+        tenants = get_all_tenants()
+        payments = get_all_payments()
+        complaints = get_all_complaints()
+        pending = sum(1 for t in tenants if t.get("balance", 0) > 0)
+        open_complaints = sum(1 for c in complaints if c.get("status") == "Open")
+        total_collected = sum(p.get("amount", 0) for p in payments)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(f"""
+            <div class='metric-card'>
+              <div class='metric-label'>Total Tenants</div>
+              <div class='metric-value'>{len(tenants)}</div>
+            </div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"""
+            <div class='metric-card'>
+              <div class='metric-label'>Rent Collected</div>
+              <div class='metric-value'>₹{total_collected:,.0f}</div>
+            </div>""", unsafe_allow_html=True)
+        with c3:
+            st.markdown(f"""
+            <div class='metric-card'>
+              <div class='metric-label'>Pending Payments</div>
+              <div class='metric-value'>{pending}</div>
+            </div>""", unsafe_allow_html=True)
+        with c4:
+            st.markdown(f"""
+            <div class='metric-card'>
+              <div class='metric-label'>Open Complaints</div>
+              <div class='metric-value'>{open_complaints}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── Tenants ────────────────────────────────────────────────────────────────
+    with admin_tabs[1]:
+        st.markdown("<div class='section-header'>All Tenants</div>", unsafe_allow_html=True)
+        tenants = get_all_tenants()
+        if tenants:
+            rows = []
+            for t in tenants:
+                rows.append({
+                    "Name": t.get("name", ""),
+                    "Unit": t.get("unit", ""),
+                    "Email": t.get("email", ""),
+                    "Phone": t.get("phone", ""),
+                    "Rent": f"₹{t.get('rent', 0):,.0f}",
+                    "Balance": f"₹{t.get('balance', 0):,.0f}",
+                    "Status": "Overdue" if t.get("balance", 0) > 0 else "Current",
+                })
+            df_tenants = pd.DataFrame(rows)
+            def highlight_status(val):
+                if val == "Overdue":
+                    return "background-color: #2a2010; color: #c49a3a"
+                return "background-color: #1a2e24; color: #3a7d5c"
+            styled_t = df_tenants.style.applymap(highlight_status, subset=["Status"])
+            st.dataframe(styled_t, use_container_width=True)
+        else:
+            st.info("No tenants found.")
+
+    # ── Payments ───────────────────────────────────────────────────────────────
+    with admin_tabs[2]:
+        st.markdown("<div class='section-header'>All Payments</div>", unsafe_allow_html=True)
+        payments = get_all_payments()
+        if payments:
+            df_pay = pd.DataFrame(payments)
+            st.dataframe(df_pay, use_container_width=True)
+            total = sum(p.get("amount", 0) for p in payments)
+            st.markdown(f"**Total Collected: ₹{total:,.0f}**")
+        else:
+            st.info("No payments recorded.")
+
+        st.markdown("---")
+        st.markdown("<div class='section-header'>Record Manual Payment</div>", unsafe_allow_html=True)
+        all_tenants = get_all_tenants()
+        if all_tenants:
+            tenant_names = [t["name"] for t in all_tenants]
+            sel_tenant_name = st.selectbox("Tenant", tenant_names, key="manual_pay_tenant")
+            sel_tenant = next((t for t in all_tenants if t["name"] == sel_tenant_name), None)
+            manual_amount = st.number_input("Amount ($)", min_value=0.0, step=50.0, key="manual_amount")
+            manual_date = st.date_input("Date", key="manual_date")
+            if st.button("Record Payment"):
+                if sel_tenant:
+                    ok = record_manual_payment(
+                        sel_tenant["id"], sel_tenant["name"],
+                        sel_tenant["unit"], manual_amount,
+                        str(manual_date)
+                    )
+                    if ok:
+                        st.success("Payment recorded.")
+                    else:
+                        st.error("Failed to record payment.")
+
+    # ── Complaints ─────────────────────────────────────────────────────────────
+    with admin_tabs[3]:
+        st.markdown("<div class='section-header'>Complaints</div>", unsafe_allow_html=True)
+        complaints = get_all_complaints()
+        if complaints:
+            for c in complaints:
+                badge = "<span class='badge-green'>Resolved</span>" if c.get("status") == "Resolved" else "<span class='badge-amber'>Open</span>"
+                st.markdown(f"""
+                <div class='metric-card'>
+                  <div><strong>{c.get('tenant_name','')}</strong> — Unit {c.get('unit','')} &nbsp;{badge}</div>
+                  <div class='metric-sub'><strong>Category:</strong> {c.get('category','')}</div>
+                  <div class='metric-sub'><strong>Subject:</strong> {c.get('subject','')}</div>
+                  <div class='metric-sub'>{c.get('message','')}</div>
+                  <div class='metric-sub'>Filed: {c.get('date','')}</div>
+                </div>""", unsafe_allow_html=True)
+                if c.get("status") != "Resolved":
+                    if st.button("Mark Resolved", key=f"resolve_{c['id']}"):
+                        resolve_complaint(c["id"])
+                        st.rerun()
+        else:
+            st.info("No complaints filed.")
+
+        st.markdown("---")
+        st.markdown("<div class='section-header'>Feedback</div>", unsafe_allow_html=True)
+        feedbacks = get_all_feedback()
+        if feedbacks:
+            for f in feedbacks:
+                st.markdown(f"""
+                <div class='metric-card'>
+                  <div><strong>{f.get('tenant_name','')}</strong> — Unit {f.get('unit','')}</div>
+                  <div class='metric-sub'><strong>Topic:</strong> {f.get('topic','')} | <strong>Rating:</strong> {f.get('rating','')}/5</div>
+                  <div class='metric-sub'>{f.get('details','')}</div>
+                  <div class='metric-sub'>Follow-up: {'Yes' if f.get('follow_up') else 'No'}</div>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.info("No feedback submitted.")
+
+    # ── Announcements ──────────────────────────────────────────────────────────
+    with admin_tabs[4]:
+        st.markdown("<div class='section-header'>Post Announcement</div>", unsafe_allow_html=True)
+        ann_title = st.text_input("Title", key="ann_title")
+        ann_message = st.text_area("Message", key="ann_message")
+        ann_priority = st.selectbox("Priority", ["Low", "Medium", "High"], key="ann_priority")
+        if st.button("Post Announcement"):
+            if ann_title and ann_message:
+                ok = add_announcement(ann_title, ann_message, ann_priority)
+                if ok:
+                    st.success("Announcement posted.")
+                    st.rerun()
+                else:
+                    st.error("Failed to post announcement.")
+            else:
+                st.error("Title and message are required.")
+
+        st.markdown("<div class='section-header'>All Announcements</div>", unsafe_allow_html=True)
+        announcements = get_announcements()
+        for a in announcements:
+            priority = a.get("priority", "Low")
+            badge_cls = "badge-amber" if priority == "High" else "badge-blue" if priority == "Medium" else "badge-green"
+            st.markdown(f"""
+            <div class='metric-card'>
+              <div><strong>{a.get('title','')}</strong> &nbsp;<span class='{badge_cls}'>{priority}</span></div>
+              <div class='metric-sub'>{a.get('message','')}</div>
+              <div class='metric-sub'>{a.get('date','')}</div>
+            </div>""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TENANT VIEW
+# ═══════════════════════════════════════════════════════════════════════════════
+else:
+    tenant_name = user["name"]
+    tenant_unit = user["unit"]
+    tenant_rent = user["rent"]
+    tenant_balance = user["balance"]
+
+    tabs = st.tabs(["Dashboard", "Chat Assistant", "Rent & Payments", "Feedback"])
+
+    ####################
+    # Tab 1: Dashboard
+    ####################
+    with tabs[0]:
+        st.markdown(
+            f"<div class='section-header'>Good to see you, {tenant_name}. Unit {tenant_unit} summary.</div>",
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            balance_badge = (
+                "<span class='badge-amber'>Payment Due</span>"
+                if tenant_balance > 0
+                else "<span class='badge-green'>On Time</span>"
+            )
+            st.markdown(f"""
+            <div class='metric-card'>
+              <div class='metric-label'>Rent Status</div>
+              <div class='metric-value'>₹{tenant_rent:,.0f}</div>
+              <div class='metric-sub'>Balance Due: ₹{tenant_balance:,.0f}</div>
+              <div style='margin-top:8px;'>{balance_badge}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            st.markdown("""
+            <div class='metric-card'>
+              <div class='metric-label'>Lease Status</div>
+              <div class='metric-value'>Active</div>
+              <div class='metric-sub'>Expires December 31, 2025</div>
+              <div style='margin-top:8px;'><span class='badge-blue'>182 days remaining</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col3:
+            st.markdown("""
+            <div class='metric-card'>
+              <div class='metric-label'>Open Maintenance</div>
+              <div class='metric-value'>0</div>
+              <div class='metric-sub'>No active requests</div>
+              <div style='margin-top:8px;'><span class='badge-green'>All Clear</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<div class='section-header'>Upcoming</div>", unsafe_allow_html=True)
+        r1, r2 = st.columns(2)
+        from datetime import date
+        today = date.today()
+        next_due = date(2025, 12, 1)
+        days_until = (next_due - today).days
+        with r1:
+            st.markdown(f"""
+            <div class='metric-card'>
+              <div class='metric-label'>Next Rent Due</div>
+              <div class='metric-value'>₹{tenant_rent:,.0f}</div>
+              <div class='metric-sub'>Due {next_due.strftime('%B %d, %Y')}</div>
+              <div style='margin-top:8px;'><strong style='color:#4a7fe8'>{days_until} days remaining</strong></div>
+            </div>
+            """, unsafe_allow_html=True)
+        with r2:
+            st.markdown("""
+            <div class='metric-card building-alert-card'>
+              <div class='metric-label'><span class='section-icon' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M12 9v4m0 3h.01M10.29 3.86l-8.18 14.15A1 1 0 0 0 3 19.5h18a1 1 0 0 0 .87-1.49L13.71 3.86a1 1 0 0 0-1.42 0z'/></svg></span>Building Alerts</div>
+              <div class='metric-sub'>Elevator C maintenance scheduled Feb 25 — use elevators A or B</div>
+              <div class='metric-sub'>Pool opens May 1 — registration opens April 15</div>
+              <div class='metric-sub'>Pest control treatment second Tuesday of each month</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<div class='section-header'><span class='section-icon' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M4 7h16M4 12h16M4 17h10'/></svg></span>Amenity Hours</div>", unsafe_allow_html=True)
+        amenities = [
+            ["Fitness Center", "5:00 AM – 11:00 PM", "Floor 2", "Key fob required"],
+            ["Swimming Pool", "8:00 AM – 9:00 PM", "Rooftop", "May 1 – Oct 31 only"],
+            ["Rooftop Lounge", "9:00 AM – 10:00 PM", "Rooftop", "Book via portal, max 20 guests"],
+            ["Business Center", "7:00 AM – 10:00 PM", "Floor 1", "Printing ₹0.10/page"],
+            ["Laundry Room", "7:00 AM – 10:00 PM", "Floor 1", "App payment only"],
+            ["Package Room", "24 hours", "Lobby", "Packages held 7 days"]
+        ]
+        df_amen = pd.DataFrame(amenities, columns=["Amenity", "Hours", "Location", "Notes"])
+        st.table(df_amen)
+
+        st.markdown("<div class='section-header'><span class='section-icon' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M12 2l8 4v6c0 5-3.4 9.4-8 10-4.6-.6-8-5-8-10V6l8-4z'/><path d='M12 8v4m0 4h.01'/></svg></span>Emergency Contacts</div>", unsafe_allow_html=True)
         st.markdown("""
         <div class='metric-card'>
-          <div class='metric-label'>Rent Status</div>
-          <div class='metric-value'>$1,850</div>
-          <div class='metric-sub'>Due December 1, 2025</div>
-          <div style='margin-top:8px;'><span class='badge-green'>On Time</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.markdown("""
-        <div class='metric-card'>
-          <div class='metric-label'>Lease Status</div>
-          <div class='metric-value'>Active</div>
-          <div class='metric-sub'>Expires December 31, 2025</div>
-          <div style='margin-top:8px;'><span class='badge-blue'>182 days remaining</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col3:
-        st.markdown("""
-        <div class='metric-card'>
-          <div class='metric-label'>Open Maintenance</div>
-          <div class='metric-value'>0</div>
-          <div class='metric-sub'>No active requests</div>
-          <div style='margin-top:8px;'><span class='badge-green'>All Clear</span></div>
+          <div class='metric-sub'><strong>Leasing Office:</strong> +91 98765 43210 | leasing@riversideapts.com</div>
+          <div class='metric-sub'><strong>Emergency Maintenance:</strong> +91 98765 43211 (24/7)</div>
+          <div class='metric-sub'><strong>Non-emergency police:</strong> 100</div>
+          <div class='metric-sub'><strong>Fire / Medical:</strong> 112</div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("<div class='section-header'>Upcoming</div>", unsafe_allow_html=True)
-    r1, r2 = st.columns(2)
-    from datetime import date
-    today = date.today()
-    next_due = date(2025, 12, 1)
-    days_until = (next_due - today).days
-    with r1:
-        st.markdown(f"""
-        <div class='metric-card'>
-          <div class='metric-label'>Next Rent Due</div>
-          <div class='metric-value'>$1,850</div>
-          <div class='metric-sub'>Due {next_due.strftime('%B %d, %Y')}</div>
-          <div style='margin-top:8px;'><strong style='color:#4a7fe8'>{days_until} days remaining</strong></div>
-        </div>
-        """, unsafe_allow_html=True)
-    with r2:
-        st.markdown("""
-        <div class='metric-card building-alert-card'>
-          <div class='metric-label'><span class='section-icon' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M12 9v4m0 3h.01M10.29 3.86l-8.18 14.15A1 1 0 0 0 3 19.5h18a1 1 0 0 0 .87-1.49L13.71 3.86a1 1 0 0 0-1.42 0z'/></svg></span>Building Alerts</div>
-          <div class='metric-sub'>Elevator C maintenance scheduled Feb 25 — use elevators A or B</div>
-          <div class='metric-sub'>Pool opens May 1 — registration opens April 15</div>
-          <div class='metric-sub'>Pest control treatment second Tuesday of each month</div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("---")
 
-    st.markdown("<div class='section-header'><span class='section-icon' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M4 7h16M4 12h16M4 17h10'/></svg></span>Amenity Hours</div>", unsafe_allow_html=True)
-    import pandas as pd
-    amenities = [
-        ["Fitness Center", "5:00 AM – 11:00 PM", "Floor 2", "Key fob required"],
-        ["Swimming Pool", "8:00 AM – 9:00 PM", "Rooftop", "May 1 – Oct 31 only"],
-        ["Rooftop Lounge", "9:00 AM – 10:00 PM", "Rooftop", "Book via portal, max 20 guests"],
-        ["Business Center", "7:00 AM – 10:00 PM", "Floor 1", "Printing $0.10/page"],
-        ["Laundry Room", "7:00 AM – 10:00 PM", "Floor 1", "App payment only"],
-        ["Package Room", "24 hours", "Lobby", "Packages held 7 days"]
-    ]
-    df_amen = pd.DataFrame(amenities, columns=["Amenity", "Hours", "Location", "Notes"])
-    st.table(df_amen)
+    ########################
+    # Tab 2: Chat Assistant
+    ########################
+    with tabs[1]:
+        st.markdown("### Ask anything about your lease, building policies, or maintenance.")
+        st.caption("Knowledge base powered by ScaleDown compression")
 
-    st.markdown("<div class='section-header'><span class='section-icon' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M12 2l8 4v6c0 5-3.4 9.4-8 10-4.6-.6-8-5-8-10V6l8-4z'/><path d='M12 8v4m0 4h.01'/></svg></span>Emergency Contacts</div>", unsafe_allow_html=True)
-    st.markdown("""
-    <div class='metric-card'>
-      <div class='metric-sub'><strong>Leasing Office:</strong> (512) 847-3300 | leasing@riversideapts.com</div>
-      <div class='metric-sub'><strong>Emergency Maintenance:</strong> (512) 847-3311 (24/7)</div>
-      <div class='metric-sub'><strong>Non-emergency police:</strong> 311</div>
-      <div class='metric-sub'><strong>Fire / Medical:</strong> 911</div>
-    </div>
-    """, unsafe_allow_html=True)
+        # Display chat history
+        for msg in st.session_state["messages"]:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
 
-    st.markdown("---")
+        # Process any prefilled messages immediately (those added by sidebar buttons)
+        if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
+            last = st.session_state["messages"][-1]["content"]
+            # If last message has not yet been answered (no assistant reply after it), process
+            idx = len(st.session_state["messages"]) - 1
+            answered = False
+            if idx + 1 < len(st.session_state["messages"]):
+                for m in st.session_state["messages"][idx+1:]:
+                    if m["role"] == "assistant":
+                        answered = True
+                        break
+            if not answered:
+                with st.chat_message("assistant"):
+                    with st.spinner("Compressing with ScaleDown + thinking with Gemini..."):
+                        compressed, orig_tokens, comp_tokens = compress_knowledge(last)
+                        answer = get_gemini_answer(last, compressed)
+                        st.markdown(answer)
+                        if orig_tokens and comp_tokens:
+                            st.caption(f"ScaleDown compressed {orig_tokens} -> {comp_tokens} tokens before sending to Gemini")
+                st.session_state["messages"].append({"role": "assistant", "content": answer})
 
-########################
-# Tab 2: Chat Assistant
-########################
-with tabs[1]:
-    st.markdown("### Ask anything about your lease, building policies, or maintenance.")
-    st.caption("Knowledge base powered by ScaleDown compression")
+        # Chat input
+        question = st.chat_input("Ask anything about your lease, maintenance, payments or amenities...")
 
-    # Display chat history
-    for msg in st.session_state["messages"]:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
+        if question:
+            st.session_state["messages"].append({"role": "user", "content": question})
+            with st.chat_message("user"):
+                st.write(question)
 
-    # Process any prefilled messages immediately (those added by sidebar buttons)
-    if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
-        last = st.session_state["messages"][-1]["content"]
-        # If last message has not yet been answered (no assistant reply after it), process
-        idx = len(st.session_state["messages"]) - 1
-        answered = False
-        if idx + 1 < len(st.session_state["messages"]):
-            for m in st.session_state["messages"][idx+1:]:
-                if m["role"] == "assistant":
-                    answered = True
-                    break
-        if not answered:
             with st.chat_message("assistant"):
                 with st.spinner("Compressing with ScaleDown + thinking with Gemini..."):
-                    compressed, orig_tokens, comp_tokens = compress_knowledge(last)
-                    answer = get_gemini_answer(last, compressed)
+                    compressed, orig_tokens, comp_tokens = compress_knowledge(question)
+                    answer = get_gemini_answer(question, compressed)
                     st.markdown(answer)
                     if orig_tokens and comp_tokens:
                         st.caption(f"ScaleDown compressed {orig_tokens} -> {comp_tokens} tokens before sending to Gemini")
             st.session_state["messages"].append({"role": "assistant", "content": answer})
 
-    # Chat input
-    question = st.chat_input("Ask anything about your lease, maintenance, payments or amenities...")
+    ########################
+    # Tab 3: Rent & Payments
+    ########################
+    with tabs[2]:
+        st.markdown("<div class='section-header'>Payment Summary</div>", unsafe_allow_html=True)
+        # Refresh balance from session state (may have updated)
+        tenant_balance = st.session_state["user"]["balance"]
+        if tenant_balance == 0:
+            st.markdown("<span class='badge-green'>No Payment Due</span>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<span class='badge-amber'>Payment Due: ₹{tenant_balance:,.0f}</span>", unsafe_allow_html=True)
 
-    if question:
-        st.session_state["messages"].append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.write(question)
+        st.markdown(f"""
+        <div class='metric-card'>
+          <div class='metric-label'>Monthly Rent</div>
+          <div class='metric-value'>₹{tenant_rent:,.0f}</div>
+          <div class='metric-sub'>Balance Due: ₹{tenant_balance:,.0f}</div>
+          <div class='metric-sub'>Late Fee if missed: ₹75</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Compressing with ScaleDown + thinking with Gemini..."):
-                compressed, orig_tokens, comp_tokens = compress_knowledge(question)
-                answer = get_gemini_answer(question, compressed)
-                st.markdown(answer)
-                if orig_tokens and comp_tokens:
-                    st.caption(f"ScaleDown compressed {orig_tokens} -> {comp_tokens} tokens before sending to Gemini")
-        st.session_state["messages"].append({"role": "assistant", "content": answer})
+        with st.form("payment_form"):
+            st.markdown("#### Payment Details")
+            cardholder = st.text_input("Cardholder Name")
+            card_number = st.text_input("Card Number", max_chars=16, placeholder="1234567890123456")
+            exp_col, cvv_col = st.columns(2)
+            with exp_col:
+                expiry = st.text_input("Expiry MM/YY", placeholder="MM/YY")
+            with cvv_col:
+                cvv = st.text_input("CVV", type="password", max_chars=3, placeholder="123")
+            billing_zip = st.text_input("Billing ZIP", max_chars=5, placeholder="78701")
+            pay_submitted = st.form_submit_button(f"Pay ₹{tenant_balance:,.0f}")
+            if pay_submitted:
+                if not all([cardholder, card_number, expiry, cvv, billing_zip]):
+                    st.error("All payment fields are required.")
+                else:
+                    ok = add_payment(
+                        user["id"], tenant_name, tenant_unit, tenant_balance
+                    )
+                    if ok:
+                        st.session_state["user"]["balance"] = 0
+                        st.success("Payment processed successfully")
+                        st.balloons()
+                    else:
+                        st.error("Payment failed. Please try again.")
 
-########################
-# Tab 3: Rent & Payments
-########################
-with tabs[2]:
-    st.markdown("<div class='section-header'>Payment Summary</div>", unsafe_allow_html=True)
-    st.markdown("""
-    <div class='metric-card'>
-      <div class='metric-label'>Monthly Rent</div>
-      <div class='metric-value'>$1,850</div>
-      <div class='metric-sub'>Security Deposit Paid: $1,850</div>
-      <div class='metric-sub'>Pet Deposit: N/A</div>
-      <div class='metric-sub'>Last Payment: November 1, 2025 — $1,850 (On Time)</div>
-      <div class='metric-sub'>Next Due: December 1, 2025 (grace period until December 5)</div>
-      <div class='metric-sub'>Late Fee if missed: $75</div>
-    </div>
-    """, unsafe_allow_html=True)
+        st.markdown("<div class='section-header'>Payment History</div>", unsafe_allow_html=True)
+        payment_history = get_tenant_payments(user["id"])
+        if payment_history:
+            df_hist = pd.DataFrame(payment_history)
+            st.dataframe(df_hist, use_container_width=True)
+        else:
+            st.info("No payment history found.")
 
-    st.markdown("<div class='section-header'>Payment History</div>", unsafe_allow_html=True)
-    import pandas as pd
-    history = pd.DataFrame([
-        ["July 2025", "$1,850", "Jul 1", "Jul 1", "On Time"],
-        ["August 2025", "$1,850", "Aug 1", "Aug 3", "On Time"],
-        ["September 2025", "$1,850", "Sep 1", "Sep 1", "On Time"],
-        ["October 2025", "$1,850", "Oct 1", "Oct 7", "Late — $75 fee applied"],
-        ["November 2025", "$1,850", "Nov 1", "Nov 1", "On Time"]
-    ], columns=["Month", "Amount", "Due Date", "Paid Date", "Status"])
+    ########################
+    # Tab 4: Feedback
+    ########################
+    with tabs[3]:
+        st.markdown("<div class='section-header'>Feedback</div>", unsafe_allow_html=True)
+        topic = st.selectbox("What is your feedback about?", ["General", "Maintenance", "Amenities", "Leasing Office", "Building Cleanliness", "Noise Complaint", "Other"])
+        rating = st.select_slider("Rate your experience", options=[1,2,3,4,5], value=5, format_func=lambda x: {1:'Poor',2:'Fair',3:'Good',4:'Very Good',5:'Excellent'}[x])
+        details = st.text_area("Tell us more (optional)", placeholder="Share any details about your experience...")
+        follow = st.checkbox("I would like a follow-up from the leasing team")
+        if st.button("Submit Feedback"):
+            ok = add_feedback(
+                user["id"], tenant_name, tenant_unit,
+                topic, rating, details, follow
+            )
+            if ok:
+                st.success("Thank you for your feedback. Our team reviews all submissions within 2 business days.")
+            else:
+                st.error("Failed to submit feedback.")
 
-    def color_status(val):
-        if 'Late' in val:
-            return 'background-color: #2a2010; color: #c49a3a'
-        return 'background-color: #1a2e24; color: #3a7d5c'
-
-    styled = history.style.applymap(color_status, subset=['Status'])
-    st.dataframe(styled, use_container_width=True)
-
-    st.markdown("<div class='section-header'>Payment Methods</div>", unsafe_allow_html=True)
-    st.markdown("- Online portal: portal.riversideapts.com\n- Check payable to: Riverside Property Management LLC\n- Bank transfer: contact leasing for ACH details")
-
-########################
-# Tab 4: Feedback
-########################
-with tabs[3]:
-    st.markdown("<div class='section-header'>Feedback</div>", unsafe_allow_html=True)
-    topic = st.selectbox("What is your feedback about?", ["General", "Maintenance", "Amenities", "Leasing Office", "Building Cleanliness", "Noise Complaint", "Other"])
-    rating = st.select_slider("Rate your experience", options=[1,2,3,4,5], value=5, format_func=lambda x: {1:'Poor',2:'Fair',3:'Good',4:'Very Good',5:'Excellent'}[x])
-    details = st.text_area("Tell us more (optional)", placeholder="Share any details about your experience...")
-    follow = st.checkbox("I would like a follow-up from the leasing team")
-    if st.button("Submit Feedback"):
-        entry = {"topic": topic, "rating": rating, "details": details, "follow_up": follow}
-        st.session_state["feedback_log"].append(entry)
-        st.success("Thank you for your feedback. Our team reviews all submissions within 2 business days.")
-    st.markdown(f"{len(st.session_state['feedback_log'])} pieces of feedback submitted this session")
+        st.markdown("---")
+        st.markdown("<div class='section-header'>Submit a Complaint</div>", unsafe_allow_html=True)
+        c_subject = st.text_input("Subject", key="complaint_subject")
+        c_category = st.selectbox("Category", ["Noise", "Maintenance", "Neighbor", "Building Issue", "Other"], key="complaint_category")
+        c_message = st.text_area("Describe your complaint", key="complaint_message")
+        if st.button("Submit Complaint"):
+            if c_subject and c_message:
+                ok = add_complaint(
+                    user["id"], tenant_name, tenant_unit,
+                    c_subject, c_category, c_message
+                )
+                if ok:
+                    ref = random.randint(1000, 9999)
+                    st.success(f"Complaint submitted. Reference #: {ref}")
+                else:
+                    st.error("Failed to submit complaint.")
+            else:
+                st.error("Subject and message are required.")

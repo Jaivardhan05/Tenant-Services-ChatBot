@@ -6,3 +6,4 @@ server/uploads/
 venv/
 **/.DS_Store
 client/
+app_backup_old.py
